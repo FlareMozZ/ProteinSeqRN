@@ -1,5 +1,5 @@
 export const AMINO_ACIDS: string[] = "ACDEFGHIKLMNPQRSTVWY".split("");
-
+//function calls
 const AA_INDEX: Record<string, number> = AMINO_ACIDS.reduce(
   (m, aa, i) => ((m[aa] = i), m),
   {} as Record<string, number>

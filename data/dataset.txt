@@ -1,0 +1,1 @@
+#This file explains the given format of FASTA FILE

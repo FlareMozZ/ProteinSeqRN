@@ -24,7 +24,7 @@ import {
   DIPEPTIDES,
 } from "./proteinFeatures";
 
-// ------------------ Theme ------------------
+// ------------------ Theme (can be updated) ------------------
 const palette = {
   bg: "#0B1020",
   card: "#121833",
