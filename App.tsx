@@ -25,6 +25,7 @@ import {
   DIPEPTIDES,
   TRIPEPTIDES,
 } from "./proteinFeatures";
+import { transform } from "typescript";
 
 // ------------------ Theme (can be updated) ------------------
 const palette = {
@@ -966,7 +967,7 @@ setUniprotResults(hits);
              <View style={{ flex: 1 }}>
                 <StatsPanel stats={stats} />
              </View>
-             <View style={{ flex: 1 }}>
+             <View style={{flex:1,width:'100%'}}>
                 {/* <Card style={{height: '100%'}}>
                     <SectionLabel>UniProt Analysis</SectionLabel>
                     {uniprotResults.length > 0 ? (
@@ -983,7 +984,7 @@ setUniprotResults(hits);
                     )}
                 </Card> */}
                 {/* Inside the return statement -> UniProt Analysis Card */}
-<Card style={{ height: '100%' }}>
+<Card style={{ height: '100%' ,  width: '100%'}}>
   <SectionLabel>UniProt Analysis</SectionLabel>
   {uniprotResults.length > 0 ? (
     uniprotResults.map((r, i) => (
@@ -1056,10 +1057,10 @@ setUniprotResults(hits);
               </Card>
 
               <View style={[styles.grid, { flexDirection: isWide ? "row" : "column" }]}>
-                 <Card style={{ flex: 1 }}>
+                 <Card style={{ flex: 1, width: '100%'}}>
                     <AABarChart aaComp={features.aaComp} />
                  </Card>
-                 <Card style={{ flex: 1 }}>
+                 <Card style={{ flex: 1, width: '100%'}}>
                     <DipeptideHeatmap diComp={features.diComp} />
                  </Card>
               </View>
