@@ -1,6 +1,7 @@
 import React, { useMemo, useState, useEffect, useCallback } from "react";
 import {
   Platform,
+  Linking,
   SafeAreaView,
   ScrollView,
   StatusBar,
@@ -22,21 +23,23 @@ import {
   computeFeaturesForSeq,
   singleSeqToCsv,
   DIPEPTIDES,
+  TRIPEPTIDES,
 } from "./proteinFeatures";
 
 // ------------------ Theme (can be updated) ------------------
 const palette = {
-  bg: "#0B1020",
-  card: "#121833",
-  cardAlt: "#0E1530",
-  text: "#E7EAF6",
-  subtle: "#A7B0D8",
-  primary: "#7C9CFF",
-  primaryStrong: "#5E81FF",
+  // warmer, biology-oriented teal palette
+  bg: "#071923",
+  card: "#0B2E2E",
+  cardAlt: "#072826",
+  text: "#E8FFF8",
+  subtle: "#9ED8C3",
+  primary: "#3AD3B2",
+  primaryStrong: "#18C39B",
   danger: "#FF6B6B",
-  success: "#6BFFB0",
-  border: "#1D2750",
-  chip: "#1A2347",
+  success: "#7AF2B2",
+  border: "#0F524F",
+  chip: "#083B39",
 };
 const spacing = (n: number) => n * 8;
 const VALID_CHARS = new Set(AA_ORDER);
@@ -44,8 +47,8 @@ const VALID_CHARS = new Set(AA_ORDER);
 // ------------------ Types ------------------
 type Stats = { length: number; composition: Record<string, number>; polarPct: number; };
 
-type FastaRecord = { header: string; sequence: string };
-type RecordMeta = { idx: number; gene: string; length: number; first30: string };
+type FastaRecord = { header: string; id?: string; description?: string; sequence: string };
+type RecordMeta = { idx: number; gene: string; length: number; first30: string; id?: string; description?: string; header?: string; uniprot?: any };
 
 type PreviewJSON = {
   total_sequences: number;
@@ -56,6 +59,9 @@ type PreviewJSON = {
   total_dipeptides: number;
   first10_dipeptides: string[];
   dipeptide_composition_first_sequence_first10: Record<string, number>;
+  total_tripeptides: number;
+  first10_tripeptides: string[];
+  tripeptide_composition_first_sequence_first10: Record<string, number>;
   feature_vector_preview_first3_first10: Array<Record<string, number>>;
   feature_table_shape: [number, number];
   head_rows: Array<Record<string, number | string>>;
@@ -70,6 +76,14 @@ function extractGene(header: string) {
   const m = header.match(/GN=([^\s]+)/);
   return m ? m[1] : "";
 }
+
+function extractAccessionFromId(idStr?: string) {
+  if (!idStr) return "";
+  const parts = idStr.split("|");
+  if (parts.length >= 2) return parts[1];
+  return idStr;
+}
+
 function validateSequence(seq: string) {
   if (!seq) return { ok: false as const, message: "Sequence is empty." };
   for (let i = 0; i < seq.length; i++) {
@@ -100,14 +114,25 @@ function parseFasta(text: string): FastaRecord[] {
   let header = "", seq = "";
   for (const line of lines) {
     if (line.startsWith(">")) {
-      if (header) out.push({ header, sequence: seq });
+      if (header) {
+        // split header into id (first token) and description (rest)
+        const full = header;
+        const [idToken, ...descParts] = full.split(/\s+/);
+        const desc = descParts.join(" ") || "";
+        out.push({ header: full, id: idToken || "", description: desc, sequence: seq });
+      }
       header = line.slice(1).trim();
       seq = "";
     } else {
       seq += line.trim();
     }
   }
-  if (header) out.push({ header, sequence: seq });
+  if (header) {
+    const full = header;
+    const [idToken, ...descParts] = full.split(/\s+/);
+    const desc = descParts.join(" ") || "";
+    out.push({ header: full, id: idToken || "", description: desc, sequence: seq });
+  }
   return out;
 }
 async function readPickedFileAsText(asset: DocumentPicker.DocumentPickerAsset): Promise<string> {
@@ -152,17 +177,26 @@ async function shareOrDownloadJson(filename: string, obj: any) {
 // table builder for many sequences without UI jank
 async function buildCsvFromRecordsChunked(
   records: FastaRecord[],
+  metas?: RecordMeta[],
   floatDigits?: number,
   onProgress?: (done: number, total: number) => void
 ) {
-  const headerRow = ["GeneName", ...AA_ORDER, ...DIPEPTIDES].join(",");
+  // metadata columns + geneName (UniProt skipped in CSV for performance)
+  const metaCols = ["ID", "Description", "Header", "GeneName"];
+  const headerRow = [...metaCols, ...AA_ORDER, ...DIPEPTIDES, ...TRIPEPTIDES].join(",");
   const rows = [headerRow];
 
   for (let i = 0; i < records.length; i++) {
     const r = records[i];
     const g = extractGene(r.header);
     const seq = normalizeSequence(r.sequence);
-    const csv = singleSeqToCsv(seq, g, floatDigits);
+    const m = metas && metas[i] ? metas[i] : undefined;
+    const metaObj = {
+      id: r.id ?? (m as any)?.id ?? "",
+      description: r.description ?? (m as any)?.description ?? "",
+      header: r.header,
+    };
+    const csv = singleSeqToCsv(seq, g, floatDigits, metaObj as any);
     rows.push(csv.split("\n")[1]);
 
     if (onProgress && (i % 50 === 0 || i === records.length - 1)) onProgress(i + 1, records.length);
@@ -172,14 +206,21 @@ async function buildCsvFromRecordsChunked(
 }
 
 // --------- Colab-style preview ----------
-function featureRowForSeq(seq: string, geneName: string) {
-  const { aaComp, diComp } = computeFeaturesForSeq(seq);
-  const row: Record<string, number | string> = { GeneName: geneName };
+function featureRowForSeq(seq: string, geneName: string, meta?: RecordMeta) {
+  const { aaComp, diComp, triComp } = computeFeaturesForSeq(seq);
+  const row: Record<string, number | string> = {
+    ID: meta?.id ?? "",
+    Description: meta?.description ?? "",
+    Header: meta?.header ?? "",
+    GeneName: geneName,
+  };
   AA_ORDER.forEach((aa, i) => (row[aa] = aaComp[i]));
   DIPEPTIDES.forEach((dp, i) => (row[dp] = diComp[i]));
+  // populate tripeptide preview values for the head rows (be cautious, triComp length is 8000)
+  TRIPEPTIDES.forEach((tp, i) => (row[tp] = triComp[i]));
   return row;
 }
-function buildPreviewJSON(records: FastaRecord[]): PreviewJSON {
+function buildPreviewJSON(records: FastaRecord[], metas?: RecordMeta[]): PreviewJSON {
   const total = records.length;
   const first3 = records.slice(0, 3).map((r, idx) => {
     const s = normalizeSequence(r.sequence);
@@ -197,6 +238,11 @@ function buildPreviewJSON(records: FastaRecord[]): PreviewJSON {
   const dpCompFirst10: Record<string, number> = {};
   first10DP.forEach((dp, i) => (dpCompFirst10[dp] = firstDPComp[i]));
 
+  const first10TP = TRIPEPTIDES.slice(0, 10);
+  const firstTPComp = computeFeaturesForSeq(firstSeqNorm).triComp;
+  const tpCompFirst10: Record<string, number> = {};
+  first10TP.forEach((tp, i) => (tpCompFirst10[tp] = firstTPComp[i]));
+
   const first10FeatureKeys = AA_ORDER.slice(0, 10);
   const fprev = records.slice(0, 3).map((r) => {
     const s = normalizeSequence(r.sequence);
@@ -206,11 +252,13 @@ function buildPreviewJSON(records: FastaRecord[]): PreviewJSON {
     return obj;
   });
 
-  const headCols = ["GeneName", ...AA_ORDER, ...DIPEPTIDES];
-  const headRows = records.slice(0, 5).map(r => {
+  const metaCols = ["ID", "Description", "Header", "GeneName"];
+  const headCols = [...metaCols, ...AA_ORDER, ...DIPEPTIDES, ...TRIPEPTIDES];
+  const headRows = records.slice(0, 5).map((r, idx) => {
     const g = extractGene(r.header);
     const s = normalizeSequence(r.sequence);
-    return featureRowForSeq(s, g);
+    const m = metas && metas[idx] ? metas[idx] : undefined;
+    return featureRowForSeq(s, g, m);
   });
 
   return {
@@ -222,8 +270,11 @@ function buildPreviewJSON(records: FastaRecord[]): PreviewJSON {
     total_dipeptides: DIPEPTIDES.length,
     first10_dipeptides: first10DP,
     dipeptide_composition_first_sequence_first10: dpCompFirst10,
+    total_tripeptides: TRIPEPTIDES.length,
+    first10_tripeptides: first10TP,
+    tripeptide_composition_first_sequence_first10: tpCompFirst10,
     feature_vector_preview_first3_first10: fprev,
-    feature_table_shape: [total, 1 + AA_ORDER.length + DIPEPTIDES.length],
+    feature_table_shape: [total, metaCols.length + AA_ORDER.length + DIPEPTIDES.length + TRIPEPTIDES.length],
     head_rows: headRows,
     head_columns: headCols,
   };
@@ -236,11 +287,19 @@ function toColabStyleText(p: PreviewJSON) {
     lines.push(`Seq${s.index} length=${s.length}, first 30 aa: ${s.first30}`)
   );
   lines.push(`\nFirst 3 extracted gene names:\n${JSON.stringify(p.first_gene_names)}`);
+  // if head_rows provided include first 3 ID/Description samples (if present)
+  if (p.head_rows && p.head_rows[0]) {
+    const sampleIds = p.head_rows.slice(0, 3).map(r => ({ ID: (r as any).ID, Description: (r as any).Description }));
+    lines.push(`\nFirst 3 IDs/descriptions:\n${JSON.stringify(sampleIds)}`);
+  }
   lines.push(`\nList of amino acids considered: ${JSON.stringify(p.amino_acids)}`);
   lines.push(`\nAmino acid composition example for first sequence:\n${JSON.stringify(p.aa_composition_first_sequence)}`);
   lines.push(`\nTotal dipeptides considered: ${p.total_dipeptides}`);
   lines.push(`First 10 dipeptides: ${JSON.stringify(p.first10_dipeptides)}`);
   lines.push(`\nDipeptide composition example for first sequence (first 10 values):\n${JSON.stringify(p.dipeptide_composition_first_sequence_first10)}`);
+  lines.push(`\nTotal tripeptides considered: ${p.total_tripeptides}`);
+  lines.push(`First 10 tripeptides: ${JSON.stringify(p.first10_tripeptides)}`);
+  lines.push(`\nTripeptide composition example for first sequence (first 10 values):\n${JSON.stringify(p.tripeptide_composition_first_sequence_first10)}`);
   lines.push(`\nGenerating full feature table...`);
   lines.push(`\nFeature vector preview for sequence 1:\n${JSON.stringify(p.feature_vector_preview_first3_first10[0])}`);
   if (p.feature_vector_preview_first3_first10[1])
@@ -385,6 +444,34 @@ function DipeptideHeatmap({ diComp }: { diComp: number[] }) {
   );
 }
 
+// Top N tripeptides list (practical way to visualize 8k features)
+function TripeptideTopList({ triComp, topN = 30 }: { triComp: number[]; topN?: number }) {
+  if (!triComp || triComp.length === 0) return null;
+  // collect top indices
+  const items = triComp
+    .map((v, i) => ({ i, v }))
+    .sort((a, b) => b.v - a.v)
+    .slice(0, topN);
+  const max = items.length ? items[0].v || 1e-6 : 1e-6;
+
+  return (
+    <View>
+      <Text style={styles.sectionLabel}>Top {topN} Tripeptides</Text>
+      <ScrollView style={{ maxHeight: 320 }}>
+        {items.map(({ i, v }) => (
+          <View key={i} style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <Text style={{ width: 90, color: palette.text, fontWeight: "700" }}>{TRIPEPTIDES[i]}</Text>
+            <View style={{ flex: 1 }}>
+              <View style={styles.statBarTrack}><View style={[styles.statBarFill, { width: `${(v / max) * 100}%` }]} /></View>
+              <Text style={{ color: palette.subtle, fontSize: 12 }}>{(v * 100).toFixed(3)}%</Text>
+            </View>
+          </View>
+        ))}
+      </ScrollView>
+    </View>
+  );
+}
+
 // ------------------ UI components ------------------
 function Header() {
   return (
@@ -400,7 +487,7 @@ function Card({ children, style }: { children: React.ReactNode; style?: any }) {
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return <Text style={styles.sectionLabel}>{children}</Text>;
 }
-function PrimaryButton({ label, onPress, disabled }: { label: string; onPress: () => void; disabled?: boolean }) {
+function PrimaryButton({ label, onPress, disabled, style }: { label: string; onPress: () => void; disabled?: boolean; style?: any }) {
   return (
     <Pressable
       accessibilityRole="button"
@@ -410,6 +497,7 @@ function PrimaryButton({ label, onPress, disabled }: { label: string; onPress: (
         styles.primaryBtn,
         disabled && { opacity: 0.5 },
         pressed && { transform: [{ scale: 0.98 }] },
+        style
       ]}
     >
       <Text style={styles.primaryBtnText}>{label}</Text>
@@ -430,8 +518,8 @@ function ProteinInput({
   geneName: string; onGeneNameChange: (next: string) => void;
 }) {
   return (
-    <Card>
-      <SectionLabel>Input Sequence</SectionLabel>
+    <View>
+      <SectionLabel>1. Input Sequence</SectionLabel>
       <Text style={styles.monoHint}>Paste a protein sequence (1-letter codes). Allowed: {AA_ORDER.join("")}</Text>
       <TextInput
         accessibilityLabel="Protein sequence input"
@@ -456,7 +544,7 @@ function ProteinInput({
       />
       {!!error && <Text style={styles.errorText}>{error}</Text>}
       <View style={styles.inputActionsRow}><GhostButton label="Clear" onPress={onClear} /></View>
-    </Card>
+    </View>
   );
 }
 function StatBar({ value, max }: { value: number; max: number }) {
@@ -472,7 +560,7 @@ function StatsPanel({ stats }: { stats: Stats | null }) {
   const maxAA = Math.max(...Object.values(stats.composition));
   return (
     <Card>
-      <SectionLabel>Sequence Summary</SectionLabel>
+      <SectionLabel>2. Sequence Summary</SectionLabel>
       <View style={{ gap: spacing(1.5) }}>
         <Text style={styles.kpi}>Length: <Text style={styles.kpiNumber}>{stats.length}</Text></Text>
         <Text style={styles.kpi}>Polar ratio (demo): <Text style={styles.kpiNumber}>{stats.polarPct}%</Text></Text>
@@ -488,16 +576,6 @@ function StatsPanel({ stats }: { stats: Stats | null }) {
     </Card>
   );
 }
-function Actions({ onPredict, onExport, disabled }: { onPredict: () => void; onExport: () => void; disabled: boolean }) {
-  return (
-    <Card style={{ alignItems: "flex-start" }}>
-      <SectionLabel>Run</SectionLabel>
-      <Text style={styles.subtleText}>Compute features on-device (no backend). CSV has AA & 400 dipeptide frequencies.</Text>
-      <PrimaryButton label="Export Features CSV" onPress={onExport} disabled={disabled} />
-      <GhostButton label="Predict (coming soon)" onPress={onPredict} />
-    </Card>
-  );
-}
 function FooterNote() {
   return (<View style={styles.footer}><Text style={styles.footerText}>Built with React Native · iOS · Android · Web</Text></View>);
 }
@@ -506,7 +584,7 @@ function FooterNote() {
 function SequenceBrowser({
   metas, selectedIdx, onSelect, onUseInInput,
 }: {
-  metas: { idx: number; gene: string; length: number; first30: string }[];
+  metas: RecordMeta[];
   selectedIdx: number | null;
   onSelect: (idx: number) => void;
   onUseInInput: (idx: number) => void;
@@ -526,7 +604,7 @@ function SequenceBrowser({
   const visibleMetas = filtered.slice(0, visible);
   const hasMore = filtered.length > visible;
 
-  const Row = ({ item }: { item: { idx: number; gene: string; length: number; first30: string } }) => {
+  const Row = ({ item }: { item: { idx: number; gene: string; length: number; first30: string; id?: string; description?: string } }) => {
     const active = selectedIdx === item.idx;
     return (
       <Pressable
@@ -605,6 +683,23 @@ export default function App() {
 
   const { width } = useWindowDimensions();
 
+  // UniProt lookup states
+  const [uniprotQuery, setUniprotQuery] = useState("");
+  const [uniprotLoading, setUniprotLoading] = useState(false);
+  const [uniprotError, setUniprotError] = useState<string | null>(null);
+  const [uniprotResults, setUniprotResults] = useState<Array<any>>([]);
+
+  // helper to pick a sensible default query: prefer accession from selected record ID, else geneName
+  const defaultUniProtQuery = useMemo(() => {
+    if (selectedIdx != null && metas[selectedIdx]) {
+      const idtok = metas[selectedIdx].id || "";
+      const acc = extractAccessionFromId(idtok);
+      if (acc) return acc;
+    }
+    if (geneName) return geneName;
+    return "";
+  }, [selectedIdx, metas, geneName]);
+
   // If a sequence is selected from the browser, visualize that; otherwise use the manual input
   const currentSeq = useMemo(() => {
     if (selectedIdx != null && records && records[selectedIdx]) {
@@ -622,26 +717,136 @@ export default function App() {
   useEffect(() => { if (!rawInput) setRawInput("MTEITAAMVKELRESTGAGMMDCK"); }, []);
   const isWide = width >= 900;
 
-  const handlePredict = () => alert("Model integration pending.");
-
-  const handleExportCsv = async () => {
-    // CSV export uses the INPUT sequence + optional geneName (so it’s explicit)
-    const seq = normalizeSequence(rawInput);
-    const val = validateSequence(seq);
-    if (!val.ok) return alert(val.message);
+  // UniProt search helper (FIXED API CALL)
+  async function fetchUniProt(query: string) {
+    if (!query || !query.trim()) throw new Error("Query empty");
+    setUniprotLoading(true);
+    setUniprotError(null);
+    setUniprotResults([]);
     try {
-      const csv = singleSeqToCsv(seq, geneName.trim() || undefined);
-      setCsvOutput(csv);
-      await shareOrDownloadCsv("protein_features.csv", csv);
-    } catch (e: any) {
-      console.warn(e); alert("Failed to export CSV: " + (e?.message ?? String(e)));
+      const params = new URLSearchParams();
+      // Valid fields for UniProtKB: accession, id, protein_name, organism_name, length, cc_function
+      const fields = ["accession", "id", "protein_name", "organism_name", "length", "cc_function", "cc_subcellular_location", "cc_disease", "sequence", "go"];
+      params.append("format", "json");
+      params.append("fields", fields.join(","));
+
+      let url = "";
+      // Check if query looks like a specific accession to use the direct endpoint
+      if (/^[A-Za-z0-9]{6,10}$/.test(query)) {
+        url = `https://rest.uniprot.org/uniprotkb/${query}?${params.toString()}`;
+      } else {
+        // Otherwise search
+        params.append("query", query);
+        params.append("size", "5");
+        url = `https://rest.uniprot.org/uniprotkb/search?${params.toString()}`;
+      }
+      
+      // Inside App.tsx -> fetchUniProt function
+
+// ... previous setup code ...
+const r = await fetch(url, { headers: { accept: "application/json" } });
+// ... error handling ...
+const j = await r.json();
+
+const rawHits = j.results ? j.results : [j];
+
+const hits = rawHits.map((h: any) => {
+    const accession = h.primaryAccession || h.accession || "";
+    const id = h.uniProtkbId || h.id || "";
+    const proteinName = h.proteinDescription?.recommendedName?.fullName?.value || h.proteinName || "";
+    const organism = h.organism?.scientificName || h.organism_name || "";
+    const length = h.sequence?.length || h.length || 0;
+    
+    const comments = h.comments || [];
+    const goTerms = h.goTerms || []; // GO terms are now available here
+
+    // 1. Function: Prioritize the dedicated FUNCTION comment
+    const funcComment = comments.find((c:any) => c.type === 'FUNCTION')?.texts?.[0]?.value || "";
+    
+    // 2. GO Terms Fallback: Use Molecular Function (Aspect 'F')
+    const goFunction = goTerms
+        .filter((g: any) => g.goAspect === 'F') // Filter by Molecular Function aspect ('F')
+        .map((g: any) => g.term)
+        .join("; ");
+        
+    const func = funcComment || goFunction || ""; // Use function comment, or GO function terms
+
+    // 3. Subcellular Location
+    const subcell = comments
+      .filter((c:any) => c.type === 'SUBCELLULAR_LOCATION')
+      .flatMap((c:any) => c.subcellularLocations?.map((l:any) => l.location?.value))
+      .filter(Boolean)
+      .join("; ");
+
+    // 4. Disease / Pathology
+    const disease = comments.find((c:any) => c.type === 'DISEASE')?.disease?.description || "";
+
+    // 5. Mass (Daltons)
+    const mass = h.sequence?.molWeight ? `${h.sequence.molWeight} Da` : "";
+    
+    const urlEntry = accession ? `https://www.uniprot.org/uniprotkb/${accession}` : undefined;
+    
+    // Return the expanded object
+    return { accession, id, proteinName, organism, length, function: func, subcell, disease, mass, url: urlEntry };
+});
+
+
+
+setUniprotResults(hits);
+      // const r = await fetch(url, { headers: { accept: "application/json" } });
+      // if (!r.ok) {
+      //   throw new Error(`UniProt search failed: ${r.status}`);
+      // }
+      // const j = await r.json();
+      
+      // // Normalize single entry vs search results
+      // const rawHits = j.results ? j.results : [j];
+      
+      // const hits = rawHits.map((h: any) => {
+      //   const accession = h.primaryAccession || h.accession || "";
+      //   const id = h.uniProtkbId || h.id || ""; // API returns 'uniProtkbId' in search or 'id' in entry
+      //   const proteinName = h.proteinDescription?.recommendedName?.fullName?.value || h.proteinName || "";
+      //   const organism = h.organism?.scientificName || h.organism_name || "";
+      //   const length = h.sequence?.length || h.length || 0;
+      //   // Function comment extraction
+      //   const func = h.cc_function || (h.comments ? h.comments.find((c:any)=>c.type==='FUNCTION')?.texts[0]?.value : "") || "";
+      //   const urlEntry = accession ? `https://www.uniprot.org/uniprotkb/${accession}` : undefined;
+        
+      //   return { accession, id, proteinName, organism, length, function: func, url: urlEntry };
+      // });
+      
+      // setUniprotResults(hits);
+      setUniprotLoading(false);
+    } catch (err: any) {
+      setUniprotLoading(false);
+      setUniprotError(err?.message ?? String(err));
     }
+  }
+
+  const doSearchUniProt = () => {
+    const q = uniprotQuery || defaultUniProtQuery;
+    fetchUniProt(q);
+  };
+
+  const openUniProtEntry = async (url?:string) => {
+    if (!url) return;
+    try {
+      if (Platform.OS === 'web') window.open(url, '_blank');
+      else await Linking.openURL(url);
+    } catch (e) { console.warn('Failed to open URL', e); }
   };
 
   const handleSaveCurrentCsv = async () => {
     try {
-      if (!csvOutput) return;
-      await shareOrDownloadCsv("protein_features_view.csv", csvOutput);
+      // If we have a computed CSV (from upload), use it
+      if (csvOutput && records) {
+          await shareOrDownloadCsv("protein_features_view.csv", csvOutput);
+          return;
+      }
+      // Otherwise generate for single sequence
+      if (!features) return;
+      const csv = singleSeqToCsv(currentSeq, geneName.trim() || undefined);
+      await shareOrDownloadCsv("protein_features.csv", csv);
     } catch (e: any) {
       console.warn(e); alert("Failed to save CSV: " + (e?.message ?? String(e)));
     }
@@ -649,7 +854,7 @@ export default function App() {
 
   const handleSaveJSON = async () => {
     try {
-      if (!previewJSON) return;
+      if (!previewJSON) return alert("No JSON preview available.");
       await shareOrDownloadJson("protein_features_preview.json", previewJSON);
     } catch (e: any) {
       console.warn(e); alert("Failed to save JSON: " + (e?.message ?? String(e)));
@@ -673,22 +878,22 @@ export default function App() {
       setRecords(recs);
       const m: RecordMeta[] = recs.map((r, idx) => {
         const s = normalizeSequence(r.sequence);
-        return { idx, gene: extractGene(r.header), length: s.length, first30: s.slice(0, 30) + (s.length > 30 ? "..." : "") };
+        return { idx, gene: extractGene(r.header), length: s.length, first30: s.slice(0, 30) + (s.length > 30 ? "..." : ""), id: r.id ?? "", description: r.description ?? "", header: r.header };
       });
       setMetas(m);
-      setSelectedIdx(0); // auto-select first for visualization
+      setSelectedIdx(0);
 
-      const preview = buildPreviewJSON(recs);
+      // Generate Preview & CSV immediately (REMOVED BACKGROUND UNIPROT LOOP)
+      const preview = buildPreviewJSON(recs, m);
       setPreviewJSON(preview);
       setPreviewText(toColabStyleText(preview));
 
       setCsvOutput("Processing CSV...");
-      const fullCsv = await buildCsvFromRecordsChunked(recs, undefined, (done, total) => {
+      const fullCsv = await buildCsvFromRecordsChunked(recs, m, undefined, (done: number, total: number) => {
         setCsvOutput(`Processing CSV ${done}/${total}...`);
       });
       setCsvOutput(fullCsv);
-
-      await shareOrDownloadCsv("protein_features_multi.csv", fullCsv);
+      
     } catch (e: any) {
       console.warn(e);
       alert("Failed to process FASTA file: " + (e?.message ?? String(e)));
@@ -698,11 +903,9 @@ export default function App() {
   const handleUseInInput = (idx: number) => {
     if (!records) return;
     const r = records[idx];
-    const seq = normalizeSequence(r.sequence);
-    setRawInput(seq);
+    setRawInput(normalizeSequence(r.sequence));
     const g = extractGene(r.header);
     if (g) setGeneName(g);
-    // keep selected for visualization; user can now export CSV for that single seq
   };
 
   return (
@@ -710,90 +913,181 @@ export default function App() {
       <StatusBar barStyle="light-content" />
       <KeyboardAvoidingView behavior={Platform.select({ ios: "padding", android: undefined })} style={{ flex: 1 }}>
         <ScrollView
-  contentContainerStyle={styles.container}
-  keyboardShouldPersistTaps="handled"
-  nestedScrollEnabled
->
+          contentContainerStyle={styles.container}
+          keyboardShouldPersistTaps="handled"
+          nestedScrollEnabled
+        >
           <Header />
 
+          {/* 1. INPUT SEQUENCE AND UNIPROT LOOKUP IN ONE AREA */}
           <View style={[styles.grid, { flexDirection: isWide ? "row" : "column" }]}>
-            <View style={[styles.col, { flexBasis: isWide ? "58%" : "100%" }]}>
-              <ProteinInput
-                value={rawInput}
-                error={validateSequence(normalizeSequence(rawInput)).ok ? null : validateSequence(normalizeSequence(rawInput)).message}
-                onChange={setRawInput}
-                onClear={() => setRawInput("")}
-                geneName={geneName}
-                onGeneNameChange={setGeneName}
-              />
-
-              <Actions onPredict={handlePredict} onExport={handleExportCsv} disabled={!validateSequence(normalizeSequence(rawInput)).ok} />
-
-              <Card style={{ marginTop: spacing(2) }}>
-                <SectionLabel>Upload FASTA File</SectionLabel>
-                <Text style={styles.subtleText}>Pick a FASTA to browse and visualize sequences; export multi-row CSV automatically.</Text>
-                <PrimaryButton label="Upload FASTA" onPress={handleUploadFasta} />
-              </Card>
-
-              {/* NEW: Sequence Browser */}
-              {metas.length > 0 && (
-                <SequenceBrowser
-                  metas={metas}
-                  selectedIdx={selectedIdx}
-                  onSelect={setSelectedIdx}
-                  onUseInInput={handleUseInInput}
+             <Card style={{ flex: 1 }}>
+                <ProteinInput
+                    value={rawInput}
+                    error={validateSequence(normalizeSequence(rawInput)).ok ? null : validateSequence(normalizeSequence(rawInput)).message}
+                    onChange={setRawInput}
+                    onClear={() => setRawInput("")}
+                    geneName={geneName}
+                    onGeneNameChange={setGeneName}
                 />
-              )}
-            </View>
-
-            <View style={[styles.col, { flexBasis: isWide ? "42%" : "100%" }]}>
-              <StatsPanel stats={stats} />
-
-              {/* Visualization stack */}
-              {features && (
-                <>
-                  <Card>
-                    <KPIChips aaComp={features.aaComp} length={features.length} />
-                  </Card>
-
-                  <Card>
-                    <AABarChart aaComp={features.aaComp} />
-                  </Card>
-
-                  <Card>
-                    <DipeptideHeatmap diComp={features.diComp} />
-                  </Card>
-                </>
-              )}
-            </View>
+                <View style={{ marginTop: spacing(2), borderTopWidth: 1, borderTopColor: palette.border, paddingTop: spacing(2) }}>
+                    <SectionLabel>UniProt Lookup</SectionLabel>
+                    <Text style={styles.subtleText}>Search by Accession or Gene (for metadata only)</Text>
+                    <View style={{ flexDirection: 'row', gap: spacing(1) }}>
+                        <TextInput
+                            value={uniprotQuery}
+                            onChangeText={setUniprotQuery}
+                            placeholder={defaultUniProtQuery || "e.g., A0A0B4J2F0"}
+                            placeholderTextColor={palette.subtle}
+                            style={[styles.textarea, { minHeight: 44, flex: 1 }]}
+                        />
+                        <PrimaryButton label={uniprotLoading ? "..." : "Search"} onPress={doSearchUniProt} />
+                    </View>
+                    <View style={{marginTop: 8}}>
+                        <GhostButton label="Or Upload FASTA File" onPress={handleUploadFasta} />
+                    </View>
+                    {uniprotError && <Text style={styles.errorText}>{uniprotError}</Text>}
+                </View>
+             </Card>
           </View>
 
-          {/* CSV Preview */}
-          {csvOutput && (
-            <Card style={{ marginTop: spacing(2) }}>
-              <SectionLabel>CSV Preview</SectionLabel>
-              <ScrollView horizontal style={{ marginBottom: spacing(1) }}>
-                <Text
-                  selectable
-                  style={{
-                    fontFamily: Platform.select({
-                      web: "ui-monospace, SFMono-Regular, Menlo, monospace",
-                      default: "monospace",
-                    }),
-                    padding: spacing(1),
-                    color: palette.text,
-                  }}
-                >
-                  {csvOutput.length > 5000 ? csvOutput.slice(0, 5000) + "\n... (truncated preview)" : csvOutput}
-                </Text>
-              </ScrollView>
-              <PrimaryButton label="Save/Share Current CSV" onPress={handleSaveCurrentCsv} />
-            </Card>
+          {/* Sequence Browser if Multi-Fasta */}
+          {metas.length > 0 && (
+            <SequenceBrowser
+                metas={metas}
+                selectedIdx={selectedIdx}
+                onSelect={setSelectedIdx}
+                onUseInInput={handleUseInInput}
+            />
           )}
 
-          {/* Colab-style Summary */}
+          {/* 2. SEQUENCE SUMMARY AND UNIPROT ANALYSIS */}
+          <View style={[styles.grid, { flexDirection: isWide ? "row" : "column" }]}>
+             <View style={{ flex: 1 }}>
+                <StatsPanel stats={stats} />
+             </View>
+             <View style={{ flex: 1 }}>
+                {/* <Card style={{height: '100%'}}>
+                    <SectionLabel>UniProt Analysis</SectionLabel>
+                    {uniprotResults.length > 0 ? (
+                         uniprotResults.map((r, i) => (
+                            <View key={i} style={{ marginBottom: 16 }}>
+                                <Text style={{ color: palette.text, fontWeight: '700' }}>{r.accession} · {r.id}</Text>
+                                <Text style={styles.subtleText}>{r.proteinName} ({r.organism})</Text>
+                                <Text style={{ color: palette.text, marginTop: 4, fontSize: 12 }}>{r.function ? r.function.slice(0, 300) + (r.function.length>300?"...":"") : "No function description available."}</Text>
+                                <GhostButton label="Open on UniProt" onPress={() => openUniProtEntry(r.url)} />
+                            </View>
+                         ))
+                    ) : (
+                        <Text style={styles.subtleText}>No UniProt data loaded. Use the lookup tool above.</Text>
+                    )}
+                </Card> */}
+                {/* Inside the return statement -> UniProt Analysis Card */}
+<Card style={{ height: '100%' }}>
+  <SectionLabel>UniProt Analysis</SectionLabel>
+  {uniprotResults.length > 0 ? (
+    uniprotResults.map((r, i) => (
+      <View key={i} style={{ marginBottom: 16 }}>
+        {/* Header */}
+        <Text style={{ color: palette.text, fontWeight: '700', fontSize: 16 }}>
+          {r.id} <Text style={{ color: palette.subtle, fontSize: 14 }}>({r.accession})</Text>
+        </Text>
+        <Text style={styles.subtleText}>{r.proteinName}</Text>
+        <Text style={[styles.subtleText, { fontStyle: 'italic' }]}>{r.organism}</Text>
+
+        {/* New Fields */}
+        <View style={{ marginTop: 12, gap: 6 }}>
+          {/* Mass & Length row */}
+          <Text style={styles.subtleText}>
+            <Text style={{ fontWeight: '700', color: palette.subtle }}>Length:</Text> {r.length} aa
+            {r.mass ? `  •  ${r.mass}` : ""}
+          </Text>
+
+          {/* Location */}
+          {r.subcell ? (
+            <Text style={{ color: palette.text, fontSize: 12 }}>
+              <Text style={{ fontWeight: '700', color: palette.primary }}>Loc:</Text> {r.subcell}
+            </Text>
+          ) : null}
+
+          {/* Disease */}
+          {r.disease ? (
+            <Text style={{ color: palette.text, fontSize: 12 }}>
+              <Text style={{ fontWeight: '700', color: palette.danger }}>Pathology:</Text> {r.disease}
+            </Text>
+          ) : null}
+
+          {/* Function */}
+          {/* <Text style={{ color: palette.text, fontSize: 12, lineHeight: 18 }}>
+            <Text style={{ fontWeight: '700', color: palette.subtle }}>Func:</Text>{" "}
+            {r.function ? r.function.slice(0, 300) + (r.function.length > 300 ? "..." : "") : "No function description available."}
+          </Text> */}
+          {/* Function Display */}
+<Text style={{ color: palette.text, fontSize: 12, lineHeight: 18 }}>
+  <Text style={{ fontWeight: '700', color: palette.subtle }}>Func:</Text>{" "}
+  {r.function ? (
+      r.function.slice(0, 300) + (r.function.length > 300 ? "..." : "")
+  ) : (
+      "No function description available."
+  )}
+  {r.function && r.function.includes(";") && !r.function.includes("FUNCTION") ? (
+      <Text style={{ fontStyle: 'italic', color: palette.subtle, fontSize: 10 }}> (Derived from GO Terms)</Text>
+  ) : null}
+</Text>
+        </View>
+
+        <View style={{ marginTop: 8 }}>
+          <GhostButton label="Open on UniProt" onPress={() => openUniProtEntry(r.url)} />
+        </View>
+      </View>
+    ))
+  ) : (
+    <Text style={styles.subtleText}>No UniProt data loaded. Use the lookup tool above.</Text>
+  )}
+</Card>
+             </View>
+          </View>
+
+          {/* 3. COMPOSITION HEATMAP AND TRIPEPTIDES */}
+          {features && (
+            <>
+              <Card>
+                <KPIChips aaComp={features.aaComp} length={features.length} />
+              </Card>
+
+              <View style={[styles.grid, { flexDirection: isWide ? "row" : "column" }]}>
+                 <Card style={{ flex: 1 }}>
+                    <AABarChart aaComp={features.aaComp} />
+                 </Card>
+                 <Card style={{ flex: 1 }}>
+                    <DipeptideHeatmap diComp={features.diComp} />
+                 </Card>
+              </View>
+
+              <Card>
+                <TripeptideTopList triComp={features.triComp} />
+              </Card>
+            </>
+          )}
+
+          {/* 4. DOWNLOAD BUTTONS */}
+          <Card style={{ flexDirection: 'row', flexWrap: 'wrap', gap: spacing(2), justifyContent: 'center' }}>
+                <PrimaryButton 
+                    label="Download CSV" 
+                    onPress={handleSaveCurrentCsv} 
+                    disabled={!features}
+                />
+                <PrimaryButton 
+                    label="Download JSON" 
+                    onPress={handleSaveJSON} 
+                    disabled={!previewJSON}
+                    style={{ backgroundColor: palette.primaryStrong }}
+                />
+          </Card>
+
+          {/* 5. COLAB STYLE PREVIEW */}
           {previewText && (
-            <Card style={{ marginTop: spacing(2) }}>
+            <Card>
               <SectionLabel>Colab-style Summary</SectionLabel>
               <ScrollView horizontal>
                 <Text
@@ -813,14 +1107,6 @@ export default function App() {
             </Card>
           )}
 
-          {/* JSON Save */}
-          {previewJSON && (
-            <Card style={{ marginTop: spacing(2) }}>
-              <SectionLabel>JSON Preview</SectionLabel>
-              <PrimaryButton label="Save/Download JSON" onPress={handleSaveJSON} />
-            </Card>
-          )}
-
           <FooterNote />
         </ScrollView>
       </KeyboardAvoidingView>
@@ -828,7 +1114,7 @@ export default function App() {
   );
 }
 
-// ------------------ Styles ------------------
+// ------------------ Styles (Restored) ------------------
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: palette.bg },
   container: { padding: spacing(2), gap: spacing(2) },
